@@ -47,6 +47,30 @@ object BrowserManager {
 
     fun clearConsole() = synchronized(consoleBuffer) { consoleBuffer.clear() }
 
+    /** Make the WebView available for the caller to attach to a ViewGroup.
+     *  Detaches from any current parent. Caller owns re-attachment. */
+    fun acquire(): WebView? {
+        val wv = webView ?: return null
+        (wv.parent as? android.view.ViewGroup)?.removeView(wv)
+        return wv
+    }
+
+    /** Reset to headless mode: detach and re-apply a manual measure/layout
+     *  so JS/DOM operations (and browser_screenshot) keep working off-screen. */
+    fun releaseToHeadless() {
+        val wv = webView ?: return
+        mainHandler.post {
+            (wv.parent as? android.view.ViewGroup)?.removeView(wv)
+            wv.measure(
+                View.MeasureSpec.makeMeasureSpec(DEFAULT_WIDTH, View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(DEFAULT_HEIGHT, View.MeasureSpec.EXACTLY)
+            )
+            wv.layout(0, 0, DEFAULT_WIDTH, DEFAULT_HEIGHT)
+        }
+    }
+
+    suspend fun ensureInitialized(context: Context) = ensureWebView(context)
+
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun ensureWebView(context: Context) {
         if (webView != null) return

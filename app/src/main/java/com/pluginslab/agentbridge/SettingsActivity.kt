@@ -10,6 +10,7 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.button.MaterialButton
 import com.pluginslab.agentbridge.accessibility.BridgeAccessibilityService
+import com.pluginslab.agentbridge.browser.BrowserActivity
 import com.pluginslab.agentbridge.capture.CaptureRequestActivity
 import com.pluginslab.agentbridge.capture.ScreenCaptureService
 import com.pluginslab.agentbridge.config.Settings
@@ -78,6 +79,10 @@ class SettingsActivity : AppCompatActivity() {
             } else {
                 startActivity(Intent(this, CaptureRequestActivity::class.java))
             }
+        }
+
+        findViewById<MaterialButton>(R.id.btnOpenBrowser).setOnClickListener {
+            startActivity(Intent(this, BrowserActivity::class.java))
         }
     }
 
