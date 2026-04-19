@@ -17,8 +17,11 @@ import com.pluginslab.agentbridge.accessibility.BridgeAccessibilityService
 import com.pluginslab.agentbridge.accessibility.GestureDispatcher
 import com.pluginslab.agentbridge.accessibility.NodeRegistry
 import com.pluginslab.agentbridge.accessibility.TreeNode
+import android.webkit.CookieManager
 import com.pluginslab.agentbridge.accessibility.TreeSnapshotter
 import com.pluginslab.agentbridge.browser.BrowserManager
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
 import com.pluginslab.agentbridge.capture.ScreenCaptureService
 import io.modelcontextprotocol.kotlin.sdk.CallToolRequest
 import io.modelcontextprotocol.kotlin.sdk.CallToolResult
@@ -65,6 +68,8 @@ object ToolRegistry {
         registerBrowserInfo(server)
         registerBrowserHtml(server)
         registerBrowserScreenshot(server)
+        registerBrowserSetCookie(server)
+        registerBrowserClearCookies(server)
         registerProbe(server)
         registerRunScript(server)
     }
@@ -1692,4 +1697,55 @@ object ToolRegistry {
         "class_name", "content_description_contains",
         "clickable", "editable", "focused"
     )
+
+    // --- browser_set_cookie ---
+
+    private fun registerBrowserSetCookie(server: Server) {
+        server.addTool(
+            name = "browser_set_cookie",
+            description = "Inject a cookie into the embedded WebView's cookie jar via Android's native CookieManager. Works for HttpOnly cookies that JavaScript can't set. Pass the raw Set-Cookie string (e.g. 'li_at=VALUE; Domain=.linkedin.com; Path=/; Secure; HttpOnly'). Call before browser_navigate to a domain that needs auth.",
+            inputSchema = Tool.Input(
+                properties = buildJsonObject {
+                    put("url", buildJsonObject { put("type", "string"); put("description", "URL or origin the cookie applies to, e.g. https://www.linkedin.com") })
+                    put("cookie", buildJsonObject { put("type", "string"); put("description", "Raw Set-Cookie string: 'name=value; Domain=...; Path=/; Secure; HttpOnly'") })
+                },
+                required = listOf("url", "cookie")
+            )
+        ) { request: CallToolRequest ->
+            val svc = getService() ?: return@addTool serviceError()
+            val url = request.arguments["url"]?.jsonPrimitive?.content ?: return@addTool errorResult("Missing 'url'")
+            val cookie = request.arguments["cookie"]?.jsonPrimitive?.content ?: return@addTool errorResult("Missing 'cookie'")
+
+            BrowserManager.ensureInitialized(svc.applicationContext)
+            val cm = CookieManager.getInstance()
+            cm.setAcceptCookie(true)
+            val setResult = suspendCancellableCoroutine<Boolean> { cont ->
+                cm.setCookie(url, cookie) { success -> if (cont.isActive) cont.resume(success) }
+            }
+            cm.flush()
+            jsonResult(buildJsonObject {
+                put("success", setResult)
+                put("url", url)
+            })
+        }
+    }
+
+    // --- browser_clear_cookies ---
+
+    private fun registerBrowserClearCookies(server: Server) {
+        server.addTool(
+            name = "browser_clear_cookies",
+            description = "Clear all cookies from the embedded WebView's cookie jar. Useful to reset session state between tests.",
+            inputSchema = Tool.Input(properties = buildJsonObject {}, required = emptyList())
+        ) { _: CallToolRequest ->
+            val svc = getService() ?: return@addTool serviceError()
+            BrowserManager.ensureInitialized(svc.applicationContext)
+            val cm = CookieManager.getInstance()
+            val cleared = suspendCancellableCoroutine<Boolean> { cont ->
+                cm.removeAllCookies { success -> if (cont.isActive) cont.resume(success) }
+            }
+            cm.flush()
+            jsonResult(buildJsonObject { put("cleared", cleared) })
+        }
+    }
 }
