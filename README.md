@@ -8,7 +8,14 @@ Built for end-to-end testing, lightweight device automation, and "claude, do som
 
 ## Status
 
-v0.3.0 — headless embedded browser with JS eval + console capture (the DevTools-without-CDP trick). Tested on a Xiaomi Pad 8 Pro (HyperOS, Android 15) and a MacBook client. Other devices/Android versions are untested but nothing is hardware-specific.
+v0.4.1 — batch scripting + cookie-jar injection for the embedded browser. Tested on a Xiaomi Pad 8 Pro (HyperOS, Android 15) and a MacBook client. Other devices/Android versions are untested but nothing is hardware-specific.
+
+See `RELEASES.md` or the [GitHub Releases page](https://github.com/pluginslab/android-agent-bridge/releases) for the full history. The last four stops on the roadmap were:
+
+- **0.4.1** `browser_set_cookie` / `browser_clear_cookies` — inject HttpOnly session cookies into the WebView's jar.
+- **0.4.0** `run_script` + `probe` — batch a multi-step flow in a single MCP call, no per-step model round-trip.
+- **0.3.1–0.3.2** Visible embedded-browser UI (URL bar + back/reload), no-auto-keyboard polish.
+- **0.3.0** Embedded headless WebView with JS eval + console capture.
 
 ## Tool surface
 
@@ -44,14 +51,25 @@ v0.3.0 — headless embedded browser with JS eval + console capture (the DevTool
 - `open_url` — `ACTION_VIEW` with a URL, optionally targeted at a specific package.
 - `send_intent` — generic `Intent.ACTION_*` dispatch with `data`, `package`, `component`, `type`, `categories`, `flags`, and `extras`. Always runs as `startActivity(FLAG_ACTIVITY_NEW_TASK)` plus any flags you add.
 
-### Embedded headless browser
-Separate from Chrome — the WebView lives inside AgentBridge, so logged-in sessions and cookies don't carry over. Useful for E2E web testing where that's actually a feature (deterministic, no user state to reset).
+### Embedded browser (the DevTools-without-CDP trick)
+A second browser lives inside AgentBridge — an Android WebView with a simple URL bar (tap **Open Embedded Browser** in the app). It's sandboxed from Chrome, so logged-in sessions and cookies *don't* carry over from Chrome by default — which is actually a feature for deterministic E2E testing. The tools drive it from outside; the UI lets you inspect what's happening.
+
 - `browser_navigate` — load a URL, wait for `onPageFinished`. Clears the console buffer on each call.
 - `browser_eval` — run JavaScript, returns the JSON-encoded result. Multi-statement? Wrap in an IIFE and return.
 - `browser_console` — ring buffer (last 500) of captured `console.*` messages with level, source, and line.
 - `browser_info` — current URL + `document.title`.
 - `browser_html` — `documentElement.outerHTML`, or pass a CSS `selector` to get a single element's `outerHTML`.
 - `browser_screenshot` — draws the WebView's current rendering to a PNG. Captures full content height, below the fold included. No MediaProjection needed.
+- `browser_set_cookie` — inject a cookie into the WebView's jar via Android's native `CookieManager`. Works for `HttpOnly` cookies that JavaScript can't set (e.g. LinkedIn's `li_at`). Typical workflow: in desktop Chrome's DevTools → Application → Cookies, copy the session cookie value, paste it here, then `browser_navigate` to an authenticated URL.
+- `browser_clear_cookies` — reset the jar.
+
+### Batch scripting
+Eliminates model round-trips for multi-step flows. The agent composes a sequence of ops once, the device executes them at device speed.
+
+- `probe` — compact, curated screen survey: active window + up to N clickable/editable/focused/scrollable nodes + distinct visible texts. Much cheaper to consume than a full `get_ui_tree` when you just want to decide "what's actionable here?". Populates the node registry so IDs stay usable with subsequent calls.
+- `run_script` — execute a sequence of device-side ops in a single MCP call. Node predicates (`text_contains`, `resource_id`, `class_name`, …) are re-resolved on every step, so ephemeral node IDs never go stale. Ops supported include everything under gestures & input, app & intent launching, and embedded browser, plus `wait_for_node`, `wait_for_window`, `sleep`, `assert_node`, and `capture` (gathers final state: `find_nodes` results, device screenshot, browser screenshot, `browser_info`, active window — into named buckets in the return value). Returns a per-step trace (`{step, op, ok, ms, error?, detail?}`) so failures are diagnosable.
+
+Typical pattern on a new flow: one `probe` to learn the surface, one `run_script` to execute the whole thing.
 
 ## Setup
 
@@ -219,7 +237,17 @@ Rules of thumb that match the existing style:
 - Keep the input schema tight. Only add a parameter if it changes behaviour meaningfully.
 - Prefer `jsonResult` for structured output, `textResult` for strings, `ImageContent` for PNGs.
 - If the tool needs the accessibility service, call `getService() ?: return@addTool serviceError()` first. If it just needs a `Context`, grab `svc.applicationContext`.
-- `NodeRegistry` IDs are ephemeral — valid only until the next `get_ui_tree` / `find_nodes` / `wait_for_node` / `scroll_to_text` call. Tools that operate on a node ID should be called soon after the snapshot that produced it.
+- `NodeRegistry` IDs are ephemeral — valid only until the next `get_ui_tree` / `find_nodes` / `wait_for_node` / `scroll_to_text` / `probe` call. Tools that operate on a node ID should be called soon after the snapshot that produced it.
+- If the new op is also useful inside a scripted flow, add a branch for it in `runScriptStep(...)` so `run_script` can dispatch it.
+
+### Adding a new embedded-browser capability
+
+If it's just JavaScript, `browser_eval` probably covers it from the client side — no new tool needed. Add a dedicated tool only when:
+
+- The feature requires the native Android surface (e.g. `CookieManager` for `HttpOnly` cookies, clipboard, downloads, file pickers).
+- You want idiomatic input/output types instead of asking callers to stringify their own JS.
+
+The `BrowserManager` singleton owns the WebView. If your new tool needs a WebView-level hook (e.g. intercepting requests, subscribing to load events), add it there and expose a thin wrapper in `ToolRegistry`. The `BrowserActivity` borrows the WebView on resume and returns it on pause — don't assume the Activity is alive, but do assume the WebView is (`BrowserManager.ensureInitialized` is safe to call).
 
 ### Filing issues
 
