@@ -106,45 +106,52 @@ class ScreenCaptureService : Service() {
     }
 
     private fun setupProjection(resultCode: Int, data: Intent) {
-        val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        val mp = mpm.getMediaProjection(resultCode, data)
-        if (mp == null) {
-            Log.w(TAG, "MediaProjection is null")
-            stopSelf()
-            return
-        }
-        projection = mp
-        instance = this
-
-        handlerThread = HandlerThread("agb-cap").apply { start() }
-        handler = Handler(handlerThread!!.looper)
-
-        // Register callback before creating the virtual display (Android 14+ requirement).
-        mp.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() {
-                Log.i(TAG, "MediaProjection stopped")
+        try {
+            val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            val mp = mpm.getMediaProjection(resultCode, data)
+            if (mp == null) {
+                Log.w(TAG, "MediaProjection is null after getMediaProjection — token may have expired")
                 cleanup()
                 stopSelf()
+                return
             }
-        }, handler)
+            projection = mp
 
-        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        val metrics = DisplayMetrics()
-        @Suppress("DEPRECATION")
-        wm.defaultDisplay.getRealMetrics(metrics)
-        width = metrics.widthPixels
-        height = metrics.heightPixels
-        val density = metrics.densityDpi
+            handlerThread = HandlerThread("agb-cap").apply { start() }
+            handler = Handler(handlerThread!!.looper)
 
-        imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-        virtualDisplay = mp.createVirtualDisplay(
-            "AgentBridgeVD",
-            width, height, density,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader!!.surface,
-            null, handler
-        )
-        Log.i(TAG, "Screen capture started ${width}x${height} @${density}dpi")
+            // Register callback before creating the virtual display (Android 14+ requirement).
+            mp.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    Log.i(TAG, "MediaProjection stopped")
+                    cleanup()
+                    stopSelf()
+                }
+            }, handler)
+
+            val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getRealMetrics(metrics)
+            width = metrics.widthPixels
+            height = metrics.heightPixels
+            val density = metrics.densityDpi
+
+            imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+            virtualDisplay = mp.createVirtualDisplay(
+                "AgentBridgeVD",
+                width, height, density,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                imageReader!!.surface,
+                null, handler
+            )
+            instance = this
+            Log.i(TAG, "Screen capture started ${width}x${height} @${density}dpi")
+        } catch (t: Throwable) {
+            Log.e(TAG, "setupProjection failed", t)
+            cleanup()
+            stopSelf()
+        }
     }
 
     fun captureFrame(): ByteArray? {

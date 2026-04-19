@@ -18,6 +18,7 @@ import com.pluginslab.agentbridge.accessibility.GestureDispatcher
 import com.pluginslab.agentbridge.accessibility.NodeRegistry
 import com.pluginslab.agentbridge.accessibility.TreeNode
 import com.pluginslab.agentbridge.accessibility.TreeSnapshotter
+import com.pluginslab.agentbridge.browser.BrowserManager
 import com.pluginslab.agentbridge.capture.ScreenCaptureService
 import io.modelcontextprotocol.kotlin.sdk.CallToolRequest
 import io.modelcontextprotocol.kotlin.sdk.CallToolResult
@@ -58,6 +59,12 @@ object ToolRegistry {
         registerClearText(server)
         registerGetNotifications(server)
         registerScrollToText(server)
+        registerBrowserNavigate(server)
+        registerBrowserEval(server)
+        registerBrowserConsole(server)
+        registerBrowserInfo(server)
+        registerBrowserHtml(server)
+        registerBrowserScreenshot(server)
     }
 
     private fun getService(): BridgeAccessibilityService? = BridgeAccessibilityService.instance
@@ -1147,6 +1154,166 @@ object ToolRegistry {
                 put("found", false)
                 put("swipes", maxSwipes)
             })
+        }
+    }
+
+    // --- browser_navigate ---
+
+    private fun registerBrowserNavigate(server: Server) {
+        server.addTool(
+            name = "browser_navigate",
+            description = "Load a URL in AgentBridge's embedded headless WebView. This browser is separate from Chrome — no shared cookies/sessions. Waits for onPageFinished or times out. The WebView persists across navigate calls.",
+            inputSchema = Tool.Input(
+                properties = buildJsonObject {
+                    put("url", buildJsonObject { put("type", "string"); put("description", "URL to load, e.g. https://example.com") })
+                    put("timeout_ms", buildJsonObject { put("type", "integer"); put("description", "Max wait for page load (default 15000)") })
+                },
+                required = listOf("url")
+            )
+        ) { request: CallToolRequest ->
+            val svc = getService() ?: return@addTool serviceError()
+            val url = request.arguments["url"]?.jsonPrimitive?.content
+                ?: return@addTool errorResult("Missing 'url'")
+            val timeout = request.arguments["timeout_ms"]?.jsonPrimitive?.longOrNull ?: 15000L
+            BrowserManager.clearConsole()
+            val (ok, err) = BrowserManager.navigate(svc.applicationContext, url, timeout)
+            jsonResult(buildJsonObject {
+                put("success", ok)
+                if (!ok) put("error", err ?: "unknown")
+                put("url", url)
+            })
+        }
+    }
+
+    // --- browser_eval ---
+
+    private fun registerBrowserEval(server: Server) {
+        server.addTool(
+            name = "browser_eval",
+            description = "Evaluate JavaScript in the embedded WebView and return the JSON-encoded result. Call browser_navigate first to load a page. Single expressions work directly; wrap multi-statement logic in an IIFE and return the result.",
+            inputSchema = Tool.Input(
+                properties = buildJsonObject {
+                    put("script", buildJsonObject { put("type", "string"); put("description", "JavaScript to evaluate. Return value is JSON-encoded.") })
+                    put("timeout_ms", buildJsonObject { put("type", "integer"); put("description", "Max wait (default 5000)") })
+                },
+                required = listOf("script")
+            )
+        ) { request: CallToolRequest ->
+            val svc = getService() ?: return@addTool serviceError()
+            val script = request.arguments["script"]?.jsonPrimitive?.content
+                ?: return@addTool errorResult("Missing 'script'")
+            val timeout = request.arguments["timeout_ms"]?.jsonPrimitive?.longOrNull ?: 5000L
+            val result = BrowserManager.eval(svc.applicationContext, script, timeout)
+            if (result == null) return@addTool errorResult("eval returned null (timeout or error)")
+            textResult(result)
+        }
+    }
+
+    // --- browser_console ---
+
+    private fun registerBrowserConsole(server: Server) {
+        server.addTool(
+            name = "browser_console",
+            description = "Return buffered console messages from the embedded WebView. Captures console.log/warn/error/info from onConsoleMessage. Ring buffer holds the last 500 entries; browser_navigate clears it.",
+            inputSchema = Tool.Input(
+                properties = buildJsonObject {
+                    put("since_ms", buildJsonObject { put("type", "integer"); put("description", "Only entries with timestamp >= since_ms") })
+                    put("limit", buildJsonObject { put("type", "integer"); put("description", "Max entries (default 50)") })
+                },
+                required = emptyList()
+            )
+        ) { request: CallToolRequest ->
+            getService() ?: return@addTool serviceError()
+            val since = request.arguments["since_ms"]?.jsonPrimitive?.longOrNull
+            val limit = request.arguments["limit"]?.jsonPrimitive?.intOrNull ?: 50
+            val items = BrowserManager.consoleSince(since, limit)
+            jsonResult(buildJsonObject {
+                put("count", items.size)
+                put("messages", JsonArray(items.map { e ->
+                    buildJsonObject {
+                        put("timestamp", e.timestamp)
+                        put("level", e.level)
+                        put("message", e.message)
+                        e.source?.let { put("source", it) }
+                        put("line", e.line)
+                    }
+                }))
+            })
+        }
+    }
+
+    // --- browser_info (url + title) ---
+
+    private fun registerBrowserInfo(server: Server) {
+        server.addTool(
+            name = "browser_info",
+            description = "Return the current URL and document.title from the embedded WebView.",
+            inputSchema = Tool.Input(properties = buildJsonObject {}, required = emptyList())
+        ) { _: CallToolRequest ->
+            val svc = getService() ?: return@addTool serviceError()
+            val url = BrowserManager.eval(svc.applicationContext, "window.location.href", 3000L) ?: "null"
+            val title = BrowserManager.eval(svc.applicationContext, "document.title", 3000L) ?: "null"
+            jsonResult(buildJsonObject {
+                put("url", url)
+                put("title", title)
+            })
+        }
+    }
+
+    // --- browser_html ---
+
+    private fun registerBrowserHtml(server: Server) {
+        server.addTool(
+            name = "browser_html",
+            description = "Return document.documentElement.outerHTML from the embedded WebView as a JSON-encoded string. Optionally pass a 'selector' to return outerHTML of the first match only.",
+            inputSchema = Tool.Input(
+                properties = buildJsonObject {
+                    put("selector", buildJsonObject { put("type", "string"); put("description", "Optional CSS selector; if set, returns outerHTML of document.querySelector(selector)") })
+                },
+                required = emptyList()
+            )
+        ) { request: CallToolRequest ->
+            val svc = getService() ?: return@addTool serviceError()
+            val selector = request.arguments["selector"]?.jsonPrimitive?.contentOrNull
+            val js = if (selector.isNullOrBlank()) {
+                "document.documentElement.outerHTML"
+            } else {
+                val escaped = selector.replace("\\", "\\\\").replace("'", "\\'")
+                "(function(){var e=document.querySelector('$escaped');return e?e.outerHTML:null;})()"
+            }
+            val result = BrowserManager.eval(svc.applicationContext, js, 5000L)
+            if (result == null) return@addTool errorResult("eval failed")
+            textResult(result)
+        }
+    }
+
+    // --- browser_screenshot ---
+
+    private fun registerBrowserScreenshot(server: Server) {
+        server.addTool(
+            name = "browser_screenshot",
+            description = "Capture the embedded WebView's current rendering as a PNG. Unlike get_screenshot this doesn't require MediaProjection consent — it draws the WebView directly. Captures full content height (below the fold).",
+            inputSchema = Tool.Input(
+                properties = buildJsonObject {
+                    put("format", buildJsonObject {
+                        put("type", "string")
+                        put("description", "Return format: 'image' (default, ImageContent), 'data_url', or 'base64'")
+                        put("enum", JsonArray(listOf(JsonPrimitive("image"), JsonPrimitive("data_url"), JsonPrimitive("base64"))))
+                    })
+                },
+                required = emptyList()
+            )
+        ) { request: CallToolRequest ->
+            val svc = getService() ?: return@addTool serviceError()
+            val bytes = BrowserManager.screenshot(svc.applicationContext)
+                ?: return@addTool errorResult("No WebView content to capture. Call browser_navigate first.")
+            val format = request.arguments["format"]?.jsonPrimitive?.contentOrNull ?: "image"
+            val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+            when (format) {
+                "base64" -> textResult(b64)
+                "data_url" -> textResult("data:image/png;base64,$b64")
+                else -> CallToolResult(content = listOf(ImageContent(data = b64, mimeType = "image/png")))
+            }
         }
     }
 }

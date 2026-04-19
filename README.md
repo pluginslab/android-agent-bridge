@@ -8,7 +8,7 @@ Built for end-to-end testing, lightweight device automation, and "claude, do som
 
 ## Status
 
-v0.2.0 — screen capture + e2e quality-of-life tools. Tested on a Xiaomi Pad 8 Pro (HyperOS, Android 15) and a MacBook client. Other devices/Android versions are untested but nothing is hardware-specific.
+v0.3.0 — headless embedded browser with JS eval + console capture (the DevTools-without-CDP trick). Tested on a Xiaomi Pad 8 Pro (HyperOS, Android 15) and a MacBook client. Other devices/Android versions are untested but nothing is hardware-specific.
 
 ## Tool surface
 
@@ -43,6 +43,15 @@ v0.2.0 — screen capture + e2e quality-of-life tools. Tested on a Xiaomi Pad 8 
 - `launch_app` — foreground an app by package name.
 - `open_url` — `ACTION_VIEW` with a URL, optionally targeted at a specific package.
 - `send_intent` — generic `Intent.ACTION_*` dispatch with `data`, `package`, `component`, `type`, `categories`, `flags`, and `extras`. Always runs as `startActivity(FLAG_ACTIVITY_NEW_TASK)` plus any flags you add.
+
+### Embedded headless browser
+Separate from Chrome — the WebView lives inside AgentBridge, so logged-in sessions and cookies don't carry over. Useful for E2E web testing where that's actually a feature (deterministic, no user state to reset).
+- `browser_navigate` — load a URL, wait for `onPageFinished`. Clears the console buffer on each call.
+- `browser_eval` — run JavaScript, returns the JSON-encoded result. Multi-statement? Wrap in an IIFE and return.
+- `browser_console` — ring buffer (last 500) of captured `console.*` messages with level, source, and line.
+- `browser_info` — current URL + `document.title`.
+- `browser_html` — `documentElement.outerHTML`, or pass a CSS `selector` to get a single element's `outerHTML`.
+- `browser_screenshot` — draws the WebView's current rendering to a PNG. Captures full content height, below the fold included. No MediaProjection needed.
 
 ## Setup
 
@@ -121,6 +130,106 @@ For Claude Desktop, the equivalent config:
 - **`get_screenshot` needs per-session consent.** MediaProjection requires a user-visible "Start now" confirmation when the permission is requested. One grant lasts until the app is force-stopped or the user revokes. Fine for interactive sessions, awkward for unattended CI.
 - **Clipboard access is OEM-dependent.** Android 10+ restricts `ClipboardManager.getPrimaryClip()` to foreground / default-IME apps. HyperOS appears to allow it from our a11y service, but this isn't guaranteed.
 - **Cleartext HTTP + bearer token.** Fine on a trusted LAN; don't expose the port to the internet without a TLS proxy.
+
+## Contributing
+
+This is a hobby/research project — PRs and issues welcome. The feedback loop feels tight once you've internalised the ritual, but the first time through there are a surprising number of small things that can trip you up. Below is everything we've learned running it day-to-day.
+
+### Build & install
+
+Anywhere with JDK 17 + Android SDK 35 works (Mac, Linux, even Termux on the target device itself).
+
+```bash
+gradle :app:assembleDebug
+# APK at app/build/outputs/apk/debug/app-debug.apk
+```
+
+Side-load on the target device. No signing configuration needed for debug.
+
+### The inner loop
+
+Once the app is installed and running, the minimum repro cycle after each edit is:
+
+1. `gradle :app:assembleDebug` — incremental builds are 5–15s.
+2. Push the APK (e.g. `scp` / `adb install -r` / copy to `/sdcard/Download` and tap).
+3. Tap-install on the device → **Update** (replaces the prior install).
+4. **Re-enable the accessibility toggle** — see HyperOS gotcha below; on most OEMs it survives updates but HyperOS drops it.
+5. **Start Server** in the app if it isn't still running.
+6. In your MCP client, reconnect to pick up new tools (Claude Code: `/mcp` → reconnect `android-pad`). Tool schemas are cached at connect time — without a reconnect new tools are invisible to the client.
+
+Steps 4–6 are annoying but mandatory. Build muscle memory for them.
+
+### HyperOS / MIUI gotchas
+
+- **MIUI optimization must be OFF** before any sideloaded accessibility service can be enabled. Developer options → *MIUI optimization* → off → reboot. Without this the Accessibility toggle either doesn't appear or silently refuses to flip.
+- **The accessibility toggle gets dropped after most APK updates.** Same package, same signing — doesn't matter. Re-enable manually: Settings → Accessibility → AgentBridge → On.
+- **HyperOS dock is invisible to `service.windows`.** The tablet dock is drawn on screen but isn't exposed through the accessibility API at all, even with `flagRetrieveInteractiveWindows`. Don't waste time trying to tap dock icons — use `launch_app` / `open_url` / `send_intent` instead, which bypass the launcher entirely.
+- **Background activity starts from Termux uid are blocked.** You can SSH in and run `am start`, but HyperOS will silently refuse to foreground the target. This is why the bridge has its own `open_url` / `launch_app` / `send_intent` — they run from the accessibility service's context, which has more latitude.
+- **HyperOS doesn't let a regular app read `logcat` from other UIDs.** See "Debugging crashes without ADB" below.
+
+### Debugging crashes without ADB
+
+The app installs a `Thread.setDefaultUncaughtExceptionHandler` in `App.kt` that writes the stack trace to `/sdcard/Download/agentbridge-crash.txt`. This is readable from Termux or over `scp`, so you don't need root or ADB to see why the app died.
+
+```bash
+# From Termux on the device:
+cat /sdcard/Download/agentbridge-crash.txt
+# From your laptop:
+scp <pad>:/sdcard/Download/agentbridge-crash.txt .
+```
+
+If you're about to reproduce a crash, delete the file first so you know the new trace is fresh.
+
+### MCP transport quirks
+
+- **The server speaks legacy SSE, not Streamable HTTP.** When wiring up clients, the transport type must be `sse` and the base URL is `/`, not `/mcp`. Example for Claude Code:
+  ```bash
+  claude mcp add --transport sse android-pad http://<pad-ip>:8080/ \
+    --header "Authorization: Bearer <token>"
+  ```
+- **The URL shown in `SettingsActivity` says `/mcp`** — known cosmetic bug. The actual endpoint is `/`. Ignore the displayed path when configuring clients. (Fix is coming; the typo predates the transport switch.)
+- **Tool lists are snapshotted at connect time.** If you've added, removed, or renamed a tool, the client won't see it until you disconnect + reconnect. In Claude Code: `/mcp` dialog → pick the server → disconnect → reconnect.
+
+### MediaProjection (for `get_screenshot`)
+
+- One consent dialog per capture session. Survives until the app is force-stopped or the user revokes via the notification shade.
+- On Android 14+, there's a tight time window between the user granting consent and the service successfully creating the `VirtualDisplay`. If screen capture crashes right after granting, it's usually a `SecurityException` about using the MediaProjection token after / before the foreground service was properly started. Check `/sdcard/Download/agentbridge-crash.txt`.
+- The capture service has its own foreground notification separate from the MCP server's. Both show in the shade when capture is active.
+
+### Building on the device (Termux)
+
+Building inside Termux + proot-debian works but has one wrinkle: AGP bundles an `aapt2` that's x86_64-only. On an arm64 device this silently fails with cryptic errors. Workaround in `gradle.properties`:
+
+```
+android.aapt2FromMavenOverride=/path/to/arm64-aapt2
+```
+
+Most contributors won't hit this because most contributors will build on x86_64 hosts.
+
+### Adding a new tool
+
+Minimal recipe:
+
+1. Add `registerMyTool(server: Server)` to `ToolRegistry.kt`, copying the shape of a neighbouring tool. Each tool gets: a name, a description (the client sees this — make it specific), an input schema, and a handler.
+2. Reference the new registration from `registerAll` at the top of the object.
+3. Rebuild, reinstall, reconnect MCP. Call it.
+
+Rules of thumb that match the existing style:
+
+- Keep the input schema tight. Only add a parameter if it changes behaviour meaningfully.
+- Prefer `jsonResult` for structured output, `textResult` for strings, `ImageContent` for PNGs.
+- If the tool needs the accessibility service, call `getService() ?: return@addTool serviceError()` first. If it just needs a `Context`, grab `svc.applicationContext`.
+- `NodeRegistry` IDs are ephemeral — valid only until the next `get_ui_tree` / `find_nodes` / `wait_for_node` / `scroll_to_text` call. Tools that operate on a node ID should be called soon after the snapshot that produced it.
+
+### Filing issues
+
+Reproducers that include:
+- Android version + OEM skin (HyperOS, One UI, Pixel, stock AOSP…)
+- AgentBridge version (from SettingsActivity — still shows Server URL with a typo, use `versionName` from `build.gradle.kts`)
+- Output of `find_nodes` or `get_ui_tree` near the failure
+- Contents of `agentbridge-crash.txt` if the app died
+
+are massively easier to act on than "it doesn't work". If you can record the exact sequence of tool calls that led to the failure, even better.
 
 ## License
 
