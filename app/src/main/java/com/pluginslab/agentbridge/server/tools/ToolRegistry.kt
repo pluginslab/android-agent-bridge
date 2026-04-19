@@ -8,15 +8,20 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
+import android.util.Base64
+import android.util.DisplayMetrics
 import android.view.KeyEvent
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityNodeInfo
 import com.pluginslab.agentbridge.accessibility.BridgeAccessibilityService
 import com.pluginslab.agentbridge.accessibility.GestureDispatcher
 import com.pluginslab.agentbridge.accessibility.NodeRegistry
 import com.pluginslab.agentbridge.accessibility.TreeNode
 import com.pluginslab.agentbridge.accessibility.TreeSnapshotter
+import com.pluginslab.agentbridge.capture.ScreenCaptureService
 import io.modelcontextprotocol.kotlin.sdk.CallToolRequest
 import io.modelcontextprotocol.kotlin.sdk.CallToolResult
+import io.modelcontextprotocol.kotlin.sdk.ImageContent
 import io.modelcontextprotocol.kotlin.sdk.TextContent
 import io.modelcontextprotocol.kotlin.sdk.Tool
 import io.modelcontextprotocol.kotlin.sdk.server.Server
@@ -50,6 +55,9 @@ object ToolRegistry {
         registerGetClipboard(server)
         registerPaste(server)
         registerSendIntent(server)
+        registerClearText(server)
+        registerGetNotifications(server)
+        registerScrollToText(server)
     }
 
     private fun getService(): BridgeAccessibilityService? = BridgeAccessibilityService.instance
@@ -457,15 +465,41 @@ object ToolRegistry {
         }
     }
 
-    // --- get_screenshot (stub for v2) ---
+    // --- get_screenshot ---
 
     private fun registerGetScreenshot(server: Server) {
         server.addTool(
             name = "get_screenshot",
-            description = "[v2 stub] Returns the screen as a base64 PNG. Not yet implemented — requires MediaProjection permission flow.",
-            inputSchema = Tool.Input(properties = buildJsonObject {}, required = emptyList())
-        ) { _: CallToolRequest ->
-            errorResult("get_screenshot is not implemented in v1. Use get_ui_tree instead.")
+            description = "Capture the current screen as a PNG. Requires an active MediaProjection grant (open AgentBridge and tap 'Grant Screen Capture' once per session). By default returns an MCP ImageContent block; use format='data_url' or 'base64' for text output.",
+            inputSchema = Tool.Input(
+                properties = buildJsonObject {
+                    put("format", buildJsonObject {
+                        put("type", "string")
+                        put("description", "Return format: 'image' (default, ImageContent), 'data_url', or 'base64'")
+                        put("enum", JsonArray(listOf(JsonPrimitive("image"), JsonPrimitive("data_url"), JsonPrimitive("base64"))))
+                    })
+                },
+                required = emptyList()
+            )
+        ) { request: CallToolRequest ->
+            val cap = ScreenCaptureService.instance
+            if (cap == null || !ScreenCaptureService.isActive) {
+                return@addTool errorResult("Screen capture not granted. Open AgentBridge on the device and tap 'Grant Screen Capture'.")
+            }
+            // First acquire may be null before the first frame lands; retry briefly.
+            var bytes = cap.captureFrame()
+            if (bytes == null) {
+                delay(150)
+                bytes = cap.captureFrame()
+            }
+            if (bytes == null) return@addTool errorResult("No frame available. Try again in a moment.")
+            val format = request.arguments["format"]?.jsonPrimitive?.contentOrNull ?: "image"
+            val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+            when (format) {
+                "base64" -> textResult(b64)
+                "data_url" -> textResult("data:image/png;base64,$b64")
+                else -> CallToolResult(content = listOf(ImageContent(data = b64, mimeType = "image/png")))
+            }
         }
     }
 
@@ -980,6 +1014,139 @@ object ToolRegistry {
             } catch (e: Exception) {
                 errorResult("Failed to dispatch intent: ${e.message}")
             }
+        }
+    }
+
+    // --- clear_text ---
+
+    private fun registerClearText(server: Server) {
+        server.addTool(
+            name = "clear_text",
+            description = "Clear the text of an editable node (or the currently input-focused one) via ACTION_SET_TEXT with an empty string.",
+            inputSchema = Tool.Input(
+                properties = buildJsonObject {
+                    put("node_id", buildJsonObject { put("type", "integer"); put("description", "Optional node ID. If omitted, uses the focused node.") })
+                },
+                required = emptyList()
+            )
+        ) { request: CallToolRequest ->
+            val svc = getService() ?: return@addTool serviceError()
+            val nodeId = request.arguments["node_id"]?.jsonPrimitive?.intOrNull
+
+            val node: AccessibilityNodeInfo? = if (nodeId != null) {
+                NodeRegistry.get(nodeId)
+            } else {
+                svc.rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+            }
+            if (node == null) return@addTool errorResult("No target node")
+
+            val args = Bundle().apply {
+                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "")
+            }
+            val success = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+            jsonResult(buildJsonObject { put("success", success) })
+        }
+    }
+
+    // --- get_notifications ---
+
+    private fun registerGetNotifications(server: Server) {
+        server.addTool(
+            name = "get_notifications",
+            description = "Return a snapshot of recent notifications as captured by the accessibility service. A rolling buffer of the last 50 TYPE_NOTIFICATION_STATE_CHANGED events, newest first. Useful for e2e assertions like 'did a push notification arrive?'. Notifications that existed before AgentBridge started are not captured.",
+            inputSchema = Tool.Input(
+                properties = buildJsonObject {
+                    put("package", buildJsonObject { put("type", "string"); put("description", "Filter by exact package name") })
+                    put("since_ms", buildJsonObject { put("type", "integer"); put("description", "Only notifications with timestamp >= since_ms (unix millis)") })
+                    put("limit", buildJsonObject { put("type", "integer"); put("description", "Max entries returned (default 20)") })
+                },
+                required = emptyList()
+            )
+        ) { request: CallToolRequest ->
+            getService() ?: return@addTool serviceError()
+            val pkgFilter = request.arguments["package"]?.jsonPrimitive?.contentOrNull
+            val since = request.arguments["since_ms"]?.jsonPrimitive?.longOrNull
+            val limit = request.arguments["limit"]?.jsonPrimitive?.intOrNull ?: 20
+
+            var items = BridgeAccessibilityService.recentNotifications(since)
+            if (pkgFilter != null) items = items.filter { it.packageName == pkgFilter }
+            items = items.take(limit)
+
+            jsonResult(buildJsonObject {
+                put("count", items.size)
+                put("notifications", JsonArray(items.map { n ->
+                    buildJsonObject {
+                        put("timestamp", n.timestamp)
+                        put("package", n.packageName)
+                        put("texts", JsonArray(n.texts.map { JsonPrimitive(it) }))
+                    }
+                }))
+            })
+        }
+    }
+
+    // --- scroll_to_text ---
+
+    private fun registerScrollToText(server: Server) {
+        server.addTool(
+            name = "scroll_to_text",
+            description = "Swipe the screen up to max_swipes times until a node containing text_contains is visible. Returns the match when found, or found=false on timeout. Uses a center-column swipe across 50% of screen height.",
+            inputSchema = Tool.Input(
+                properties = buildJsonObject {
+                    put("text_contains", buildJsonObject { put("type", "string"); put("description", "Case-insensitive substring to search for in node text") })
+                    put("direction", buildJsonObject {
+                        put("type", "string")
+                        put("description", "'down' scrolls content upward (default), 'up' scrolls downward")
+                        put("enum", JsonArray(listOf(JsonPrimitive("down"), JsonPrimitive("up"))))
+                    })
+                    put("max_swipes", buildJsonObject { put("type", "integer"); put("description", "Max swipes before giving up (default 10)") })
+                    put("settle_ms", buildJsonObject { put("type", "integer"); put("description", "Delay after each swipe in ms (default 400)") })
+                },
+                required = listOf("text_contains")
+            )
+        ) { request: CallToolRequest ->
+            val svc = getService() ?: return@addTool serviceError()
+            val target = request.arguments["text_contains"]?.jsonPrimitive?.content
+                ?: return@addTool errorResult("Missing 'text_contains'")
+            val direction = request.arguments["direction"]?.jsonPrimitive?.contentOrNull ?: "down"
+            val maxSwipes = request.arguments["max_swipes"]?.jsonPrimitive?.intOrNull ?: 10
+            val settleMs = request.arguments["settle_ms"]?.jsonPrimitive?.longOrNull ?: 400L
+
+            val wm = svc.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getRealMetrics(metrics)
+            val w = metrics.widthPixels
+            val h = metrics.heightPixels
+            val cx = w / 2
+            val (y1, y2) = when (direction.lowercase()) {
+                "up" -> (h * 0.3).toInt() to (h * 0.8).toInt()
+                "down" -> (h * 0.8).toInt() to (h * 0.3).toInt()
+                else -> return@addTool errorResult("direction must be 'up' or 'down'")
+            }
+
+            for (iter in 0 until maxSwipes) {
+                val root = TreeSnapshotter.snapshotAllWindows(svc, maxDepth = 30, includeInvisible = false)
+                val all = mutableListOf<TreeNode>()
+                flatten(root, all)
+                val hit = all.firstOrNull {
+                    it.text?.contains(target, ignoreCase = true) == true ||
+                    it.contentDescription?.contains(target, ignoreCase = true) == true
+                }
+                if (hit != null) {
+                    return@addTool jsonResult(buildJsonObject {
+                        put("found", true)
+                        put("swipes", iter)
+                        put("match", nodeSummary(hit))
+                    })
+                }
+                GestureDispatcher.swipe(svc, cx.toFloat(), y1.toFloat(), cx.toFloat(), y2.toFloat(), 300L)
+                delay(settleMs)
+            }
+            jsonResult(buildJsonObject {
+                put("found", false)
+                put("swipes", maxSwipes)
+            })
         }
     }
 }

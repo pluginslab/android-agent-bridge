@@ -53,6 +53,13 @@
                     android:layout_marginBottom="4dp" />
 
                 <TextView
+                    android:id="@+id/tvCaptureStatus"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Screen Capture: Not granted"
+                    android:layout_marginBottom="4dp" />
+
+                <TextView
                     android:id="@+id/tvLanIp"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
@@ -87,6 +94,14 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="Open Accessibility Settings"
+            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+            android:layout_marginBottom="8dp" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnGrantCapture"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Grant Screen Capture"
             style="@style/Widget.MaterialComponents.Button.OutlinedButton"
             android:layout_marginBottom="8dp" />
 

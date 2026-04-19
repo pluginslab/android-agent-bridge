@@ -8,7 +8,7 @@ Built for end-to-end testing, lightweight device automation, and "claude, do som
 
 ## Status
 
-v0.1.0 — first tagged release. Tested on a Xiaomi Pad 8 Pro (HyperOS, Android 15) and a MacBook client. Other devices/Android versions are untested but nothing is hardware-specific.
+v0.2.0 — screen capture + e2e quality-of-life tools. Tested on a Xiaomi Pad 8 Pro (HyperOS, Android 15) and a MacBook client. Other devices/Android versions are untested but nothing is hardware-specific.
 
 ## Tool surface
 
@@ -18,13 +18,17 @@ v0.1.0 — first tagged release. Tested on a Xiaomi Pad 8 Pro (HyperOS, Android 
 - `find_nodes` — predicate query across the tree. Matches on `text_contains`, `text_equals`, `resource_id`, `class_name` (substring), `content_description_contains`, plus boolean filters for `clickable` / `editable` / `focused`. Flat result list, far cheaper than a full tree.
 - `wait_for_node` — same predicate as `find_nodes`, polls until match or timeout. Replaces sleep-based flakiness in tests.
 - `wait_for_window` — polls until a given package is foreground.
+- `get_notifications` — rolling buffer of the last 50 notification events captured by the accessibility service (package, texts, timestamp). Filter by `package` or `since_ms`.
+- `get_screenshot` — PNG screenshot via MediaProjection. Requires a one-time-per-session consent via the app's **Grant Screen Capture** button. Returns an MCP `ImageContent` block by default; `format="data_url"` or `"base64"` for text output.
 
 ### Gestures & input
 - `tap_node` — tap a node by its registry ID. Prefers `ACTION_CLICK`, falls back to a center-coord gesture.
 - `tap_coords` — absolute-coordinate tap.
 - `long_press_node` — long-press a node.
 - `swipe` — straight-line swipe with configurable duration.
+- `scroll_to_text` — swipes up to `max_swipes` times until a node containing the target text is visible, then returns it. Direction: `down` (default) or `up`.
 - `type_text` — `ACTION_SET_TEXT` on a focused editable node. Does not work for terminals and other non-editable views (see `set_clipboard` + `paste`).
+- `clear_text` — empty out an editable node's text.
 - `send_key_events` — `ENTER`, `BACKSPACE`, `DELETE`, `TAB`, `ESCAPE`, arrows, `HOME`/`END`, `PAGE_UP`/`PAGE_DOWN`, `SPACE`. Best-effort — Android a11y cannot inject arbitrary keystrokes without IME-level privileges.
 - `global_action` — `back`, `home`, `recents`, `notifications`, `quick_settings`, `power_dialog`.
 - `wait_for_idle` — wait until no a11y events have fired for a quiet period. Useful after triggering an animation.
@@ -39,9 +43,6 @@ v0.1.0 — first tagged release. Tested on a Xiaomi Pad 8 Pro (HyperOS, Android 
 - `launch_app` — foreground an app by package name.
 - `open_url` — `ACTION_VIEW` with a URL, optionally targeted at a specific package.
 - `send_intent` — generic `Intent.ACTION_*` dispatch with `data`, `package`, `component`, `type`, `categories`, `flags`, and `extras`. Always runs as `startActivity(FLAG_ACTIVITY_NEW_TASK)` plus any flags you add.
-
-### Stubs / v2
-- `get_screenshot` — stub. MediaProjection permission flow lands later.
 
 ## Setup
 
@@ -117,7 +118,7 @@ For Claude Desktop, the equivalent config:
 - **HyperOS dock is invisible.** `AccessibilityService.getWindows()` does not return the HyperOS tablet dock as a separate window, and it's not inside the launcher's accessibility tree either. Workarounds: `send_intent` / `launch_app` bypass the launcher entirely, or `tap_coords` with a known y-offset.
 - **Terminal text input is not supported.** `type_text` uses `ACTION_SET_TEXT`, which only works on editable `EditText`-like nodes. Terminals (Termux etc.) need a different path — the `paste` tool plus `set_clipboard` is usable if you orchestrate the long-press → Paste menu manually.
 - **`send_key_events` can't inject arbitrary keystrokes.** The a11y API exposes `ACTION_IME_ENTER` and a few other node actions, but not raw `KeyEvent` injection. Full support would require shipping a companion IME.
-- **`get_screenshot` is a stub.** MediaProjection requires a per-session user-visible consent dialog, which makes it awkward for unattended automation. Landing later.
+- **`get_screenshot` needs per-session consent.** MediaProjection requires a user-visible "Start now" confirmation when the permission is requested. One grant lasts until the app is force-stopped or the user revokes. Fine for interactive sessions, awkward for unattended CI.
 - **Clipboard access is OEM-dependent.** Android 10+ restricts `ClipboardManager.getPrimaryClip()` to foreground / default-IME apps. HyperOS appears to allow it from our a11y service, but this isn't guaranteed.
 - **Cleartext HTTP + bearer token.** Fine on a trusted LAN; don't expose the port to the internet without a TLS proxy.
 
