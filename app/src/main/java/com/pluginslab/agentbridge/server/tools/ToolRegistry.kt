@@ -65,6 +65,8 @@ object ToolRegistry {
         registerBrowserInfo(server)
         registerBrowserHtml(server)
         registerBrowserScreenshot(server)
+        registerProbe(server)
+        registerRunScript(server)
     }
 
     private fun getService(): BridgeAccessibilityService? = BridgeAccessibilityService.instance
@@ -1316,4 +1318,378 @@ object ToolRegistry {
             }
         }
     }
+
+    // --- probe (compact screen survey) ---
+
+    private fun registerProbe(server: Server) {
+        server.addTool(
+            name = "probe",
+            description = "Compact curated survey of the current screen — active window, up to N clickable/editable/focused nodes, scrollables, and top-level texts. Much cheaper to consume than get_ui_tree when you just want to decide 'what's actionable here?'. Populates the node registry so the returned IDs work with tap_node / type_text.",
+            inputSchema = Tool.Input(
+                properties = buildJsonObject {
+                    put("max_clickable", buildJsonObject { put("type", "integer"); put("description", "Cap on clickable entries (default 20)") })
+                    put("max_editable", buildJsonObject { put("type", "integer"); put("description", "Cap on editable entries (default 10)") })
+                    put("max_texts", buildJsonObject { put("type", "integer"); put("description", "Cap on distinct visible texts (default 20)") })
+                },
+                required = emptyList()
+            )
+        ) { request: CallToolRequest ->
+            val svc = getService() ?: return@addTool serviceError()
+            val maxClickable = request.arguments["max_clickable"]?.jsonPrimitive?.intOrNull ?: 20
+            val maxEditable = request.arguments["max_editable"]?.jsonPrimitive?.intOrNull ?: 10
+            val maxTexts = request.arguments["max_texts"]?.jsonPrimitive?.intOrNull ?: 20
+
+            val active = svc.rootInActiveWindow
+            val root = TreeSnapshotter.snapshotAllWindows(svc, maxDepth = 30, includeInvisible = false)
+            val all = mutableListOf<TreeNode>()
+            flatten(root, all)
+
+            val clickable = all.asSequence()
+                .filter { it.clickable && (it.text != null || it.contentDescription != null || it.resourceId != null) }
+                .take(maxClickable).toList()
+            val editable = all.asSequence()
+                .filter { it.editable }
+                .take(maxEditable).toList()
+            val focused = all.firstOrNull { it.focused }
+            val scrollables = all.filter { it.scrollable }.take(5)
+            val texts = all.mapNotNull { it.text?.trim()?.takeIf { s -> s.isNotEmpty() && s.length < 80 } }
+                .distinct().take(maxTexts)
+
+            jsonResult(buildJsonObject {
+                put("active_window", buildJsonObject {
+                    put("package", active?.packageName?.toString() ?: "unknown")
+                    put("title", active?.window?.title?.toString())
+                })
+                put("total_scanned", all.size)
+                put("clickable", JsonArray(clickable.map { nodeSummary(it) }))
+                put("editable", JsonArray(editable.map { nodeSummary(it) }))
+                focused?.let { put("focused", nodeSummary(it)) }
+                put("scrollables", JsonArray(scrollables.map { nodeSummary(it) }))
+                put("texts", JsonArray(texts.map { JsonPrimitive(it) }))
+            })
+        }
+    }
+
+    // --- run_script (batch executor) ---
+
+    private fun registerRunScript(server: Server) {
+        server.addTool(
+            name = "run_script",
+            description = "Execute a batch of device-side ops in a single MCP call — avoids model round-trips for multi-step flows. Each step names an 'op' plus its args. Predicates (text_contains / resource_id / class_name / ...) are re-resolved at each step so ephemeral node IDs don't go stale. Ops: tap, tap_coords, swipe, type_text, clear_text, send_key_events, paste, global_action, wait_for_node, wait_for_window, sleep, open_url, launch_app, browser_navigate, browser_eval, assert_node, capture.",
+            inputSchema = Tool.Input(
+                properties = buildJsonObject {
+                    put("steps", buildJsonObject {
+                        put("type", "array")
+                        put("description", "Ordered list of step objects, each with an 'op' field")
+                        put("items", buildJsonObject { put("type", "object") })
+                    })
+                    put("stop_on_error", buildJsonObject { put("type", "boolean"); put("description", "Abort on first failing step (default true)") })
+                    put("default_timeout_ms", buildJsonObject { put("type", "integer"); put("description", "Default wait/resolve timeout for ops that don't specify one (default 5000)") })
+                    put("tap_resolve_timeout_ms", buildJsonObject { put("type", "integer"); put("description", "Implicit wait for tap/type_text/clear_text/paste/long_press when resolving a predicate (default 3000)") })
+                },
+                required = listOf("steps")
+            )
+        ) { request: CallToolRequest ->
+            val svc = getService() ?: return@addTool serviceError()
+            val steps = request.arguments["steps"]?.jsonArray
+                ?: return@addTool errorResult("Missing 'steps' array")
+            val stopOnError = request.arguments["stop_on_error"]?.jsonPrimitive?.booleanOrNull ?: true
+            val defaultTimeout = request.arguments["default_timeout_ms"]?.jsonPrimitive?.longOrNull ?: 5000L
+            val tapResolveTimeout = request.arguments["tap_resolve_timeout_ms"]?.jsonPrimitive?.longOrNull ?: 3000L
+
+            val trace = mutableListOf<JsonObject>()
+            val captures = mutableMapOf<String, JsonObject>()
+            val runStart = System.currentTimeMillis()
+            var okCount = 0
+            var failedStep = -1
+
+            for ((i, stepElem) in steps.withIndex()) {
+                val step = stepElem.jsonObject
+                val op = step["op"]?.jsonPrimitive?.contentOrNull
+                val stepStart = System.currentTimeMillis()
+                if (op == null) {
+                    trace.add(buildJsonObject {
+                        put("step", i); put("op", JsonNull); put("ok", false)
+                        put("ms", 0); put("error", "missing 'op'")
+                    })
+                    failedStep = i
+                    if (stopOnError) break else continue
+                }
+
+                val (ok, error, detail) = try {
+                    runScriptStep(svc, op, step, captures, defaultTimeout, tapResolveTimeout)
+                } catch (t: Throwable) {
+                    Triple(false, t.message ?: t::class.java.simpleName, null)
+                }
+
+                val ms = System.currentTimeMillis() - stepStart
+                trace.add(buildJsonObject {
+                    put("step", i)
+                    put("op", op)
+                    put("ok", ok)
+                    put("ms", ms)
+                    if (!ok) put("error", error ?: "unknown")
+                    detail?.let { put("detail", it) }
+                })
+
+                if (ok) okCount++ else {
+                    if (failedStep < 0) failedStep = i
+                    if (stopOnError) break
+                }
+            }
+
+            jsonResult(buildJsonObject {
+                put("success", failedStep < 0)
+                put("steps_total", steps.size)
+                put("steps_ok", okCount)
+                put("duration_ms", System.currentTimeMillis() - runStart)
+                if (failedStep >= 0) put("failed_at_step", failedStep)
+                put("trace", JsonArray(trace))
+                put("captures", JsonObject(captures))
+            })
+        }
+    }
+
+    // Resolve a node matching the predicate in a step, re-snapshotting up to timeoutMs.
+    // Returns the live AccessibilityNodeInfo plus the TreeNode summary, or null.
+    private suspend fun resolveNode(
+        svc: BridgeAccessibilityService,
+        step: JsonObject,
+        timeoutMs: Long
+    ): Pair<AccessibilityNodeInfo, TreeNode>? {
+        val predicate = parsePredicate(step)
+        val start = System.currentTimeMillis()
+        while (true) {
+            val root = TreeSnapshotter.snapshotAllWindows(svc, maxDepth = 30, includeInvisible = false)
+            val flat = mutableListOf<TreeNode>()
+            flatten(root, flat)
+            val hit = flat.firstOrNull { predicate.matches(it) }
+            if (hit != null) {
+                val live = NodeRegistry.get(hit.id)
+                if (live != null) return live to hit
+            }
+            if (System.currentTimeMillis() - start >= timeoutMs) return null
+            delay(200)
+        }
+    }
+
+    private suspend fun runScriptStep(
+        svc: BridgeAccessibilityService,
+        op: String,
+        step: JsonObject,
+        captures: MutableMap<String, JsonObject>,
+        defaultTimeout: Long,
+        tapResolveTimeout: Long
+    ): Triple<Boolean, String?, JsonElement?> {
+        fun fail(msg: String) = Triple(false, msg, null as JsonElement?)
+        fun ok(detail: JsonElement? = null) = Triple(true, null as String?, detail)
+
+        when (op) {
+            "sleep" -> {
+                val ms = step["ms"]?.jsonPrimitive?.longOrNull ?: 500L
+                delay(ms)
+                return ok()
+            }
+            "tap" -> {
+                val resolveTimeout = step["timeout_ms"]?.jsonPrimitive?.longOrNull ?: tapResolveTimeout
+                val pair = resolveNode(svc, step, resolveTimeout) ?: return fail("no node matched")
+                val (live, tree) = pair
+                val (success, method) = GestureDispatcher.tapNode(svc, tree.id)
+                return if (success) ok(buildJsonObject { put("method", method); put("node", nodeSummary(tree)) })
+                else fail("tap returned false")
+            }
+            "tap_coords" -> {
+                val x = step["x"]?.jsonPrimitive?.intOrNull ?: return fail("missing x")
+                val y = step["y"]?.jsonPrimitive?.intOrNull ?: return fail("missing y")
+                val success = GestureDispatcher.tap(svc, x.toFloat(), y.toFloat())
+                return if (success) ok() else fail("tap_coords returned false")
+            }
+            "long_press" -> {
+                val resolveTimeout = step["timeout_ms"]?.jsonPrimitive?.longOrNull ?: tapResolveTimeout
+                val durationMs = step["duration_ms"]?.jsonPrimitive?.longOrNull ?: 600L
+                val pair = resolveNode(svc, step, resolveTimeout) ?: return fail("no node matched")
+                val (success, _) = GestureDispatcher.longPressNode(svc, pair.second.id, durationMs)
+                return if (success) ok() else fail("long_press returned false")
+            }
+            "swipe" -> {
+                val x1 = step["x1"]?.jsonPrimitive?.intOrNull ?: return fail("missing x1")
+                val y1 = step["y1"]?.jsonPrimitive?.intOrNull ?: return fail("missing y1")
+                val x2 = step["x2"]?.jsonPrimitive?.intOrNull ?: return fail("missing x2")
+                val y2 = step["y2"]?.jsonPrimitive?.intOrNull ?: return fail("missing y2")
+                val duration = step["duration_ms"]?.jsonPrimitive?.longOrNull ?: 300L
+                val success = GestureDispatcher.swipe(svc, x1.toFloat(), y1.toFloat(), x2.toFloat(), y2.toFloat(), duration)
+                return if (success) ok() else fail("swipe returned false")
+            }
+            "type_text" -> {
+                val text = step["text"]?.jsonPrimitive?.contentOrNull ?: return fail("missing text")
+                val node: AccessibilityNodeInfo = if (step.keys.any { it in predicateKeys }) {
+                    val resolveTimeout = step["timeout_ms"]?.jsonPrimitive?.longOrNull ?: tapResolveTimeout
+                    resolveNode(svc, step, resolveTimeout)?.first ?: return fail("no node matched")
+                } else {
+                    svc.rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                        ?: return fail("no focused editable node")
+                }
+                node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                val args = Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+                }
+                val success = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                return if (success) ok() else fail("ACTION_SET_TEXT returned false")
+            }
+            "clear_text" -> {
+                val node: AccessibilityNodeInfo = if (step.keys.any { it in predicateKeys }) {
+                    val resolveTimeout = step["timeout_ms"]?.jsonPrimitive?.longOrNull ?: tapResolveTimeout
+                    resolveNode(svc, step, resolveTimeout)?.first ?: return fail("no node matched")
+                } else {
+                    svc.rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                        ?: return fail("no focused editable node")
+                }
+                val args = Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "")
+                }
+                val success = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                return if (success) ok() else fail("clear_text returned false")
+            }
+            "send_key_events" -> {
+                // Minimal re-impl: only ENTER via IME on focused node.
+                val keys = step["keys"]?.jsonArray?.map { it.jsonPrimitive.content } ?: return fail("missing keys")
+                val focused = svc.rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                    ?: return fail("no focused node")
+                var allOk = true
+                for (k in keys) {
+                    val success = when (k.uppercase()) {
+                        "ENTER" -> focused.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                        else -> false
+                    }
+                    if (!success) { allOk = false; break }
+                }
+                return if (allOk) ok() else fail("send_key_events failed")
+            }
+            "paste" -> {
+                val node: AccessibilityNodeInfo = if (step.keys.any { it in predicateKeys }) {
+                    val resolveTimeout = step["timeout_ms"]?.jsonPrimitive?.longOrNull ?: tapResolveTimeout
+                    resolveNode(svc, step, resolveTimeout)?.first ?: return fail("no node matched")
+                } else {
+                    svc.rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                        ?: return fail("no focused node")
+                }
+                val success = node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+                return if (success) ok() else fail("paste returned false")
+            }
+            "global_action" -> {
+                val actionName = step["action"]?.jsonPrimitive?.content ?: return fail("missing action")
+                val actionMap = mapOf(
+                    "back" to android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK,
+                    "home" to android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_HOME,
+                    "recents" to android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_RECENTS,
+                    "notifications" to android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS,
+                    "quick_settings" to android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_QUICK_SETTINGS,
+                    "power_dialog" to android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_POWER_DIALOG
+                )
+                val id = actionMap[actionName] ?: return fail("unknown action $actionName")
+                val success = svc.performGlobalAction(id)
+                return if (success) ok() else fail("global_action returned false")
+            }
+            "wait_for_node" -> {
+                val timeout = step["timeout_ms"]?.jsonPrimitive?.longOrNull ?: defaultTimeout
+                val pair = resolveNode(svc, step, timeout) ?: return fail("timeout")
+                return ok(nodeSummary(pair.second))
+            }
+            "wait_for_window" -> {
+                val targetPkg = step["package"]?.jsonPrimitive?.content ?: return fail("missing package")
+                val timeout = step["timeout_ms"]?.jsonPrimitive?.longOrNull ?: defaultTimeout
+                val start = System.currentTimeMillis()
+                while (true) {
+                    val cur = svc.rootInActiveWindow?.packageName?.toString()
+                    if (cur == targetPkg) return ok(JsonPrimitive(cur))
+                    if (System.currentTimeMillis() - start >= timeout) return fail("timeout (current=$cur)")
+                    delay(200)
+                }
+                @Suppress("UNREACHABLE_CODE") return fail("unreachable")
+            }
+            "assert_node" -> {
+                val timeout = step["timeout_ms"]?.jsonPrimitive?.longOrNull ?: defaultTimeout
+                val pair = resolveNode(svc, step, timeout) ?: return fail("assertion failed: no match")
+                return ok(nodeSummary(pair.second))
+            }
+            "open_url" -> {
+                val url = step["url"]?.jsonPrimitive?.content ?: return fail("missing url")
+                val forcePkg = step["package"]?.jsonPrimitive?.contentOrNull
+                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                if (!forcePkg.isNullOrBlank()) intent.setPackage(forcePkg)
+                return try { svc.startActivity(intent); ok() } catch (e: Exception) { fail(e.message ?: "startActivity failed") }
+            }
+            "launch_app" -> {
+                val pkg = step["package"]?.jsonPrimitive?.content ?: return fail("missing package")
+                val intent = svc.packageManager.getLaunchIntentForPackage(pkg)
+                    ?: return fail("no launcher activity for $pkg")
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                return try { svc.startActivity(intent); ok() } catch (e: Exception) { fail(e.message ?: "startActivity failed") }
+            }
+            "browser_navigate" -> {
+                val url = step["url"]?.jsonPrimitive?.content ?: return fail("missing url")
+                val timeout = step["timeout_ms"]?.jsonPrimitive?.longOrNull ?: 15000L
+                BrowserManager.clearConsole()
+                val (success, err) = BrowserManager.navigate(svc.applicationContext, url, timeout)
+                return if (success) ok() else fail(err ?: "navigate failed")
+            }
+            "browser_eval" -> {
+                val script = step["script"]?.jsonPrimitive?.content ?: return fail("missing script")
+                val timeout = step["timeout_ms"]?.jsonPrimitive?.longOrNull ?: 5000L
+                val result = BrowserManager.eval(svc.applicationContext, script, timeout)
+                    ?: return fail("eval timed out or null")
+                return ok(JsonPrimitive(result))
+            }
+            "capture" -> {
+                val asName = step["as"]?.jsonPrimitive?.contentOrNull ?: "capture_${captures.size}"
+                val bucket = buildJsonObject {
+                    val findReq = step["find_nodes"] as? JsonObject
+                    if (findReq != null) {
+                        val predicate = parsePredicate(findReq)
+                        val max = findReq["max_results"]?.jsonPrimitive?.intOrNull ?: 10
+                        val root = TreeSnapshotter.snapshotAllWindows(svc, 30, false)
+                        val flat = mutableListOf<TreeNode>()
+                        flatten(root, flat)
+                        val matches = flat.filter { predicate.matches(it) }.take(max)
+                        put("find_nodes", JsonArray(matches.map { nodeSummary(it) }))
+                    }
+                    if (step["screenshot"]?.jsonPrimitive?.booleanOrNull == true) {
+                        val cap = ScreenCaptureService.instance
+                        if (cap != null && ScreenCaptureService.isActive) {
+                            val bytes = cap.captureFrame()
+                            if (bytes != null) put("screenshot_data_url", "data:image/png;base64,${Base64.encodeToString(bytes, Base64.NO_WRAP)}")
+                            else put("screenshot_error", "no frame")
+                        } else {
+                            put("screenshot_error", "MediaProjection not granted")
+                        }
+                    }
+                    if (step["browser_screenshot"]?.jsonPrimitive?.booleanOrNull == true) {
+                        val bytes = BrowserManager.screenshot(svc.applicationContext)
+                        if (bytes != null) put("browser_screenshot_data_url", "data:image/png;base64,${Base64.encodeToString(bytes, Base64.NO_WRAP)}")
+                    }
+                    if (step["browser_info"]?.jsonPrimitive?.booleanOrNull == true) {
+                        val url = BrowserManager.eval(svc.applicationContext, "window.location.href", 2000L) ?: "null"
+                        val title = BrowserManager.eval(svc.applicationContext, "document.title", 2000L) ?: "null"
+                        put("browser", buildJsonObject { put("url", url); put("title", title) })
+                    }
+                    if (step["active_window"]?.jsonPrimitive?.booleanOrNull == true) {
+                        val root = svc.rootInActiveWindow
+                        put("active_window", buildJsonObject {
+                            put("package", root?.packageName?.toString() ?: "null")
+                            put("title", root?.window?.title?.toString())
+                        })
+                    }
+                }
+                captures[asName] = bucket
+                return ok(JsonPrimitive(asName))
+            }
+            else -> return fail("unknown op '$op'")
+        }
+    }
+
+    private val predicateKeys = setOf(
+        "text_contains", "text_equals", "resource_id",
+        "class_name", "content_description_contains",
+        "clickable", "editable", "focused"
+    )
 }
