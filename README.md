@@ -1,5 +1,7 @@
 # AndroidAgentBridge
 
+![AndroidAgentBridge banner: before AI guessing, after real UI tree](assets/banner.jpg)
+
 Turn an Android device into a remote-controllable automation surface for LLM agents, over LAN.
 
 The app runs a tiny Ktor + MCP server on the device. An accessibility service reads the UI tree and dispatches gestures. Any MCP-capable client (Claude Code, Claude Desktop, a custom agent) on the same network can read the screen and perform taps, swipes, text input, and intent launches through a bearer-authenticated HTTP/SSE endpoint.

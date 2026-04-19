@@ -37,3 +37,4 @@ google-services.json
 
 # Gradle build cache leftovers
 **/build/
+session-archive/
