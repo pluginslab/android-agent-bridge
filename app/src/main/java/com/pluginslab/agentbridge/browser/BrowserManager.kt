@@ -187,6 +187,39 @@ object BrowserManager {
         return deferred.await()
     }
 
+    suspend fun setCookie(context: Context, url: String, cookie: String): Boolean {
+        ensureInitialized(context) // makes sure the WebView subsystem is warm
+        val deferred = CompletableDeferred<Boolean>()
+        mainHandler.post {
+            try {
+                val cm = android.webkit.CookieManager.getInstance()
+                cm.setAcceptCookie(true)
+                cm.setCookie(url, cookie) { ok -> deferred.complete(ok) }
+                cm.flush()
+            } catch (t: Throwable) {
+                Log.e(TAG, "setCookie failed", t)
+                deferred.complete(false)
+            }
+        }
+        return deferred.await()
+    }
+
+    suspend fun clearCookies(context: Context): Boolean {
+        ensureInitialized(context)
+        val deferred = CompletableDeferred<Boolean>()
+        mainHandler.post {
+            try {
+                val cm = android.webkit.CookieManager.getInstance()
+                cm.removeAllCookies { ok -> deferred.complete(ok) }
+                cm.flush()
+            } catch (t: Throwable) {
+                Log.e(TAG, "clearCookies failed", t)
+                deferred.complete(false)
+            }
+        }
+        return deferred.await()
+    }
+
     fun destroy() {
         mainHandler.post {
             try { webView?.destroy() } catch (_: Exception) {}

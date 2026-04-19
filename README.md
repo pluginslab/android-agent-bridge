@@ -8,10 +8,11 @@ Built for end-to-end testing, lightweight device automation, and "claude, do som
 
 ## Status
 
-v0.4.1 — batch scripting + cookie-jar injection for the embedded browser. Tested on a Xiaomi Pad 8 Pro (HyperOS, Android 15) and a MacBook client. Other devices/Android versions are untested but nothing is hardware-specific.
+v0.4.2 — stable batch scripting + cookie injection for the embedded browser. Tested on a Xiaomi Pad 8 Pro (HyperOS, Android 15) and a MacBook client. Other devices/Android versions are untested but nothing is hardware-specific.
 
-See `RELEASES.md` or the [GitHub Releases page](https://github.com/pluginslab/android-agent-bridge/releases) for the full history. The last four stops on the roadmap were:
+See the [GitHub Releases page](https://github.com/pluginslab/android-agent-bridge/releases) for the full history. Recent stops:
 
+- **0.4.2** Cookie injection fix — `CookieManager` calls must run on a thread with a Looper, so they're now dispatched through `BrowserManager`'s main handler. `browser_set_cookie` confirmed working end-to-end with LinkedIn (authenticated feed scraping).
 - **0.4.1** `browser_set_cookie` / `browser_clear_cookies` — inject HttpOnly session cookies into the WebView's jar.
 - **0.4.0** `run_script` + `probe` — batch a multi-step flow in a single MCP call, no per-step model round-trip.
 - **0.3.1–0.3.2** Visible embedded-browser UI (URL bar + back/reload), no-auto-keyboard polish.

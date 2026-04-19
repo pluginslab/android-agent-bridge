@@ -1716,13 +1716,7 @@ object ToolRegistry {
             val url = request.arguments["url"]?.jsonPrimitive?.content ?: return@addTool errorResult("Missing 'url'")
             val cookie = request.arguments["cookie"]?.jsonPrimitive?.content ?: return@addTool errorResult("Missing 'cookie'")
 
-            BrowserManager.ensureInitialized(svc.applicationContext)
-            val cm = CookieManager.getInstance()
-            cm.setAcceptCookie(true)
-            val setResult = suspendCancellableCoroutine<Boolean> { cont ->
-                cm.setCookie(url, cookie) { success -> if (cont.isActive) cont.resume(success) }
-            }
-            cm.flush()
+            val setResult = BrowserManager.setCookie(svc.applicationContext, url, cookie)
             jsonResult(buildJsonObject {
                 put("success", setResult)
                 put("url", url)
@@ -1739,12 +1733,7 @@ object ToolRegistry {
             inputSchema = Tool.Input(properties = buildJsonObject {}, required = emptyList())
         ) { _: CallToolRequest ->
             val svc = getService() ?: return@addTool serviceError()
-            BrowserManager.ensureInitialized(svc.applicationContext)
-            val cm = CookieManager.getInstance()
-            val cleared = suspendCancellableCoroutine<Boolean> { cont ->
-                cm.removeAllCookies { success -> if (cont.isActive) cont.resume(success) }
-            }
-            cm.flush()
+            val cleared = BrowserManager.clearCookies(svc.applicationContext)
             jsonResult(buildJsonObject { put("cleared", cleared) })
         }
     }
