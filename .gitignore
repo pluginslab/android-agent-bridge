@@ -1,0 +1,39 @@
+# Gradle
+.gradle/
+build/
+!gradle-wrapper.jar
+local.properties
+
+# IntelliJ / Android Studio
+.idea/
+*.iml
+*.ipr
+*.iws
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Kotlin
+.kotlin/
+
+# macOS / Linux junk
+.DS_Store
+Thumbs.db
+
+# Android build outputs
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Signing / secrets
+keystore.properties
+*.jks
+*.keystore
+google-services.json
+
+# Logs
+*.log
+
+# Gradle build cache leftovers
+**/build/
